@@ -1,64 +1,82 @@
-from concurrent import futures
-import grpc
-from train_pb2 import Ticket, User
-from train_pb2_grpc import TrainServiceServicer, add_TrainServiceServicer_to_server
+package main
 
-class TrainServiceImplementation(TrainServiceServicer):
-    tickets = []
-    sections = {"A": [], "B": []}
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net"
 
-    def PurchaseTicket(self, request, context):
-        request.price = 20.0
-        request.section = "A" if len(self.sections["A"]) <= len(self.sections["B"]) else "B"
-        self.sections[request.section].append(request)
-        return request
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
+)
 
-    def ShowReceipt(self, request, context):
-        for ticket in self.tickets:
-            if ticket.user.email == request.email:
-                return ticket
-        context.set_code(grpc.StatusCode.NOT_FOUND)
-        context.set_details("User not found")
-        return Ticket()
+type trainServer struct {
+	tickets  []*Ticket
+	sections map[string][]*Ticket
+}
 
-    def ViewUsersBySection(self, request, context):
-        for ticket in self.sections.get(request, []):
-            yield ticket
+func (s *trainServer) PurchaseTicket(ctx context.Context, request *Ticket) (*Ticket, error) {
+	request.Price = 20.0
+	request.Section = "A"
+	if len(s.tickets)%2 == 1 {
+		request.Section = "B"
+	}
+	s.tickets = append(s.tickets, request)
+	s.sections[request.Section] = append(s.sections[request.Section], request)
+	return request, nil
+}
 
-    def RemoveUser(self, request, context):
-        for section in self.sections.values():
-            for i, ticket in enumerate(section):
-                if ticket.user.email == request.email:
-                    del section[i]
-                    return ticket
-        context.set_code(grpc.StatusCode.NOT_FOUND)
-        context.set_details("User not found")
-        return Ticket()
+func (s *trainServer) ShowReceipt(ctx context.Context, user *User) (*Ticket, error) {
+	for _, ticket := range s.tickets {
+		if ticket.User.Email == user.Email {
+			return ticket, nil
+		}
+	}
+	return nil, fmt.Errorf("User not found")
+}
 
-    def ModifyUserSeat(self, request, context):
-        current_section = None
-        for section in self.sections.values():
-            for i, ticket in enumerate(section):
-                if ticket.user.email == request.user.email:
-                    current_section = section
-                    del section[i]
-                    break
+func (s *trainServer) ViewUsersBySection(section *string, stream TrainService_ViewUsersBySectionServer) error {
+	for _, ticket := range s.sections[*section] {
+		if err := stream.Send(ticket); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-        if current_section:
-            request.section = "A" if len(self.sections["A"]) <= len(self.sections["B"]) else "B"
-            self.sections[request.section].append(request)
-            return request
-        else:
-            context.set_code(grpc.StatusCode.NOT_FOUND)
-            context.set_details("User not found")
-            return Ticket()
+func (s *trainServer) RemoveUser(ctx context.Context, user *User) (*Ticket, error) {
+	for i, ticket := range s.tickets {
+		if ticket.User.Email == user.Email {
+			removedTicket := ticket
+			s.tickets = append(s.tickets[:i], s.tickets[i+1:]...)
+			delete(s.sections, ticket.Section)
+			return removedTicket, nil
+		}
+	}
+	return nil, fmt.Errorf("User not found")
+}
 
-def serve():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    add_TrainServiceServicer_to_server(TrainServiceImplementation(), server)
-    server.add_insecure_port('[::]:50051')
-    server.start()
-    server.wait_for_termination()
+func (s *trainServer) ModifyUserSeat(ctx context.Context, request *Ticket) (*Ticket, error) {
+	removedTicket, err := s.RemoveUser(ctx, request.User)
+	if err != nil {
+		return nil, err
+	}
+	return s.PurchaseTicket(ctx, request)
+}
 
-if __name__ == '__main__':
-    serve()
+func main() {
+	lis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+
+	server := grpc.NewServer()
+	trainService := &trainServer{sections: make(map[string][]*Ticket)}
+	RegisterTrainServiceServer(server, trainService)
+
+	log.Println("Server started at :50051")
+	if err := server.Serve(lis); err != nil {
+		log.Fatalf("Failed to serve: %v", err)
+	}
+}
